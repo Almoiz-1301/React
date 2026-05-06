@@ -31,7 +31,7 @@ permissions:
 
 env:
   # Comma-separated owner/repo list
-  TARGET_REPOS: "Almoiz-1301/Plugin,Almoiz-1301/Python"
+  TARGET_REPOS: "Almoiz-1301/Plugins,Almoiz-1301/"
   EVENT_TYPE: jira_feature_request
   # Set to "true" for no-AI integration tests
   USE_SIMULATED_AGGREGATION: "true"
@@ -191,6 +191,7 @@ jobs:
           import base64
           import json
           import os
+          import urllib.error
           import urllib.request
 
           issue_key = os.environ["JIRA_ISSUE_KEY"]
@@ -210,8 +211,12 @@ jobs:
           }).encode("utf-8")
 
           auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+          target_url = f"{base_url}/rest/api/3/issue/{issue_key}/comment"
+          print(f"Jira comment target issue key: {issue_key}")
+          print(f"Jira comment target URL: {target_url}")
+
           req = urllib.request.Request(
-              f"{base_url}/rest/api/3/issue/{issue_key}/comment",
+              target_url,
               data=body,
               method="POST",
               headers={
@@ -220,8 +225,20 @@ jobs:
                   "Content-Type": "application/json",
               },
           )
-          with urllib.request.urlopen(req) as resp:
-              print(f"Posted Jira comment, status={resp.status}")
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  print(f"Posted Jira comment, status={resp.status}")
+          except urllib.error.HTTPError as e:
+              err = ""
+              try:
+                  err = e.read().decode("utf-8", errors="ignore")
+              except Exception:
+                  pass
+              print(f"Jira comment failed with HTTP {e.code}: {e.reason}")
+              if err:
+                  print(f"Jira error response: {err[:1000]}")
+          except Exception as e:
+              print(f"Jira comment failed with unexpected error: {e}")
           PY
         env:
           JIRA_ISSUE_KEY: ${{ steps.payload.outputs.jira_issue_key }}
