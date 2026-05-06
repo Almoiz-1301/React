@@ -31,7 +31,7 @@ permissions:
 
 env:
   # Comma-separated owner/repo list
-  TARGET_REPOS: "Almoiz-1301/Plugins,Almoiz-1301/Python"
+  TARGET_REPOS: "Almoiz-1301/Plugins,Almoiz-1301/"
   EVENT_TYPE: jira_feature_request
   # Set to "true" for no-AI integration tests
   USE_SIMULATED_AGGREGATION: "true"
@@ -154,24 +154,33 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
+
           data = json.loads(Path("out/final-assessment.json").read_text())
-          comment = f"""h3. Multi-Repo AI Feasibility Assessment
-
-*Overall Verdict:* {data['overall_verdict']}
-*Impacted Repositories:* {", ".join(data['impacted_repositories'])}
-*Impacted Components:* {", ".join(data['impacted_components'])}
-*Effort:* {data['overall_effort_estimate']['size']} - {data['overall_effort_estimate']['rationale']}
-
-*Cross-Repo Risks:*
-""" + "\n".join([f"- [{r['severity']}] {r['type']}: {r['detail']}" for r in data["cross_repo_risks"]]) + """
-
-*Open Questions:*
-""" + "\n".join([f"- {q}" for q in data["open_questions"]]) + f"""
-
-*Confidence Score:* {data['overall_confidence_score']}
-*Orchestrator Run:* https://github.com/{__import__('os').environ['GITHUB_REPOSITORY']}/actions/runs/{__import__('os').environ['GITHUB_RUN_ID']}
-"""
+          lines = [
+              "h3. Multi-Repo AI Feasibility Assessment",
+              "",
+              f"*Overall Verdict:* {data['overall_verdict']}",
+              f"*Impacted Repositories:* {', '.join(data['impacted_repositories'])}",
+              f"*Impacted Components:* {', '.join(data['impacted_components'])}",
+              f"*Effort:* {data['overall_effort_estimate']['size']} - {data['overall_effort_estimate']['rationale']}",
+              "",
+              "*Cross-Repo Risks:*",
+          ]
+          lines.extend([f"- [{r['severity']}] {r['type']}: {r['detail']}" for r in data["cross_repo_risks"]])
+          lines.extend([
+              "",
+              "*Open Questions:*",
+          ])
+          lines.extend([f"- {q}" for q in data["open_questions"]])
+          lines.extend([
+              "",
+              f"*Confidence Score:* {data['overall_confidence_score']}",
+              f"*Orchestrator Run:* https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "",
+          ])
+          comment = "\n".join(lines)
           Path("out/jira-comment.md").write_text(comment, encoding="utf-8")
           PY
 
