@@ -2,7 +2,7 @@ name: Orchestrator Feasibility
 
 on:
   repository_dispatch:
-    types: [jira_feature_request]
+    types: [jira_feature_request_orchestrator]
   workflow_dispatch:
     inputs:
       analysis_id:
@@ -29,10 +29,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: orchestrator-${{ github.event.client_payload.analysis_id || github.run_id }}
+  cancel-in-progress: true
+
 env:
   # Comma-separated owner/repo list
   TARGET_REPOS: "Almoiz-1301/Plugin,Almoiz-1301/Python"
-  EVENT_TYPE: jira_feature_request
+  EVENT_TYPE: jira_feature_request_spoke
   POLL_TIMEOUT_SEC: "600"
   POLL_INTERVAL_SEC: "15"
   JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
