@@ -31,10 +31,10 @@ permissions:
 
 env:
   # Comma-separated owner/repo list
-  TARGET_REPOS: "Almoiz-1301/Plugin,Almoiz-1301/Python"
+  TARGET_REPOS: "Almoiz-1301/Plugin,Almoiz-1301/React"
   EVENT_TYPE: jira_feature_request
-  # Set to "true" for no-AI integration tests
-  USE_SIMULATED_AGGREGATION: "true"
+  POLL_TIMEOUT_SEC: "600"
+  POLL_INTERVAL_SEC: "15"
   JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
   JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
   JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
@@ -85,7 +85,10 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
+          import urllib.error
           import urllib.request
+          from pathlib import Path
 
           token = os.environ["GH_FANOUT_TOKEN"].strip()
           if not token:
@@ -110,7 +113,11 @@ jobs:
               "Content-Type": "application/json",
           }
 
+          out = {"dispatched": [], "failed_dispatches": []}
           for repo in repos:
+              if not re.match(r"^[^/\s]+/[^/\s]+$", repo):
+                  out["failed_dispatches"].append({"repo": repo, "error": "Invalid repo format, expected owner/repo"})
+                  continue
               url = f"https://api.github.com/repos/{repo}/dispatches"
               req = urllib.request.Request(
                   url,
@@ -118,8 +125,19 @@ jobs:
                   headers=headers,
                   method="POST",
               )
-              with urllib.request.urlopen(req) as resp:
-                  print(f"Dispatched {repo}, status={resp.status}")
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      print(f"Dispatched {repo}, status={resp.status}")
+                  out["dispatched"].append({"repo": repo})
+              except urllib.error.HTTPError as e:
+                  body = ""
+                  try:
+                      body = e.read().decode("utf-8", errors="ignore")
+                  except Exception:
+                      pass
+                  out["failed_dispatches"].append({"repo": repo, "error": f"HTTP {e.code}", "body": body[:500]})
+          Path("out").mkdir(parents=True, exist_ok=True)
+          Path("out/dispatch-results.json").write_text(json.dumps(out, ensure_ascii=True, indent=2), encoding="utf-8")
           PY
         env:
           ANALYSIS_ID: ${{ steps.idgen.outputs.analysis_id }}
@@ -129,26 +147,204 @@ jobs:
           JIRA_PRIORITY: ${{ steps.payload.outputs.jira_priority }}
           JIRA_LABELS: ${{ steps.payload.outputs.jira_labels }}
 
-      - name: Build aggregated report (simulation for v1)
+      - name: Collect spoke runs and artifacts
         run: |
-          mkdir -p out
-          cat > out/final-assessment.json <<'EOF'
-          {
-            "overall_verdict": "partially_feasible",
-            "impacted_repositories": ["Almoiz-1310/Plugins", "Almoiz-1310/AnotherRepo"],
-            "impacted_components": ["api", "ui", "integration"],
-            "overall_effort_estimate": {"size": "L", "rationale": "Cross-repo coordination required."},
-            "cross_repo_risks": [
-              {"severity": "high", "type": "architecture", "detail": "Shared contracts may need changes in more than one service."}
-            ],
-            "open_questions": [
-              "Which repository should own the new shared interface?",
-              "Should rollout be phased by repository?"
-            ],
-            "overall_confidence_score": 78,
-            "incomplete_repositories": []
+          python3 - <<'PY'
+          import io
+          import json
+          import os
+          import time
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          token = os.environ["GH_FANOUT_TOKEN"].strip()
+          analysis_id = os.environ["ANALYSIS_ID"]
+          timeout = int(os.environ.get("POLL_TIMEOUT_SEC", "600"))
+          interval = int(os.environ.get("POLL_INTERVAL_SEC", "15"))
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
           }
-          EOF
+          out_dir = Path("out")
+          dispatch = json.loads((out_dir / "dispatch-results.json").read_text(encoding="utf-8"))
+          results = []
+
+          def get_json(url):
+              req = urllib.request.Request(url, headers=headers, method="GET")
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          def find_run(repo):
+              url = f"https://api.github.com/repos/{repo}/actions/runs?event=repository_dispatch&per_page=30"
+              data = get_json(url)
+              for run in data.get("workflow_runs", []):
+                  name = run.get("name", "") or ""
+                  if name.startswith(f"spoke-{analysis_id}-"):
+                      return run
+              return None
+
+          def fetch_artifact(repo, run_id):
+              artifacts = get_json(f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100")
+              short_name = repo.split("/", 1)[1]
+              expected = f"assessment-{analysis_id}-{short_name}"
+              artifact = None
+              for item in artifacts.get("artifacts", []):
+                  if item.get("name") == expected:
+                      artifact = item
+                      break
+              if artifact is None:
+                  raise RuntimeError(f"Artifact {expected} not found")
+              req = urllib.request.Request(artifact["archive_download_url"], headers=headers, method="GET")
+              with urllib.request.urlopen(req) as resp:
+                  blob = resp.read()
+              zf = zipfile.ZipFile(io.BytesIO(blob))
+              target = None
+              for name in zf.namelist():
+                  if name.endswith("repo-assessment.json"):
+                      target = name
+                      break
+              if target is None:
+                  raise RuntimeError("repo-assessment.json not found in artifact archive")
+              return json.loads(zf.read(target).decode("utf-8"))
+
+          deadline = time.time() + timeout
+          for item in dispatch.get("dispatched", []):
+              repo = item["repo"]
+              run = None
+              while time.time() < deadline:
+                  run = find_run(repo)
+                  if run is None:
+                      time.sleep(interval)
+                      continue
+                  if run.get("status") == "completed":
+                      break
+                  time.sleep(interval)
+              if run is None:
+                  results.append({
+                      "analysis_id": analysis_id,
+                      "repo_name": repo,
+                      "repo_status": "timeout",
+                      "repo_verdict": "partially_feasible",
+                      "affected_components": [],
+                      "effort_estimate": {"size": "L", "rationale": "Spoke run not discovered before timeout."},
+                      "risks": [{"severity": "high", "type": "dependency", "detail": "No spoke run found during orchestration window."}],
+                      "open_questions": ["Why did the spoke workflow not start?"],
+                      "confidence_score": 25
+                  })
+                  continue
+              if run.get("status") != "completed":
+                  results.append({
+                      "analysis_id": analysis_id,
+                      "repo_name": repo,
+                      "repo_status": "timeout",
+                      "repo_verdict": "partially_feasible",
+                      "affected_components": [],
+                      "effort_estimate": {"size": "L", "rationale": "Spoke run timed out."},
+                      "risks": [{"severity": "high", "type": "dependency", "detail": "Spoke run did not complete in time."}],
+                      "open_questions": ["Should poll timeout be increased?"],
+                      "confidence_score": 30
+                  })
+                  continue
+              try:
+                  assessment = fetch_artifact(repo, run["id"])
+                  assessment["repo_status"] = assessment.get("repo_status", "success")
+                  results.append(assessment)
+              except Exception as e:
+                  results.append({
+                      "analysis_id": analysis_id,
+                      "repo_name": repo,
+                      "repo_status": "failed",
+                      "repo_verdict": "partially_feasible",
+                      "affected_components": [],
+                      "effort_estimate": {"size": "L", "rationale": "Artifact collection failed."},
+                      "risks": [{"severity": "high", "type": "dependency", "detail": f"Artifact retrieval failed: {e}"}],
+                      "open_questions": ["Can artifact naming and upload be validated in spoke workflow?"],
+                      "confidence_score": 30
+                  })
+
+          for failed in dispatch.get("failed_dispatches", []):
+              repo = failed.get("repo", "unknown")
+              results.append({
+                  "analysis_id": analysis_id,
+                  "repo_name": repo,
+                  "repo_status": "failed",
+                  "repo_verdict": "partially_feasible",
+                  "affected_components": [],
+                  "effort_estimate": {"size": "L", "rationale": "Dispatch failure prevented assessment."},
+                  "risks": [{"severity": "high", "type": "dependency", "detail": failed.get("error", "Dispatch failed")}],
+                  "open_questions": ["Can orchestrator token access and repo name be verified?"],
+                  "confidence_score": 20
+              })
+
+          (out_dir / "collected-assessments.json").write_text(json.dumps(results, ensure_ascii=True, indent=2), encoding="utf-8")
+          PY
+        env:
+          ANALYSIS_ID: ${{ steps.idgen.outputs.analysis_id }}
+
+      - name: Build aggregated report from spoke outputs
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          reports = json.loads(Path("out/collected-assessments.json").read_text(encoding="utf-8"))
+          if not reports:
+              raise RuntimeError("No spoke reports found for aggregation")
+
+          successful = [r for r in reports if r.get("repo_status") == "success"]
+          incomplete = [r.get("repo_name") for r in reports if r.get("repo_status") != "success"]
+
+          verdicts = [r.get("repo_verdict", "partially_feasible") for r in successful]
+          if "not_feasible" in verdicts:
+              overall_verdict = "not_feasible"
+          elif "partially_feasible" in verdicts:
+              overall_verdict = "partially_feasible"
+          else:
+              overall_verdict = "feasible"
+
+          components = []
+          risks = []
+          questions = []
+          repos = []
+          effort_order = {"S": 1, "M": 2, "L": 3, "XL": 4}
+          best_effort = "S"
+          confidence_values = []
+
+          for report in reports:
+              repos.append(report.get("repo_name", "unknown"))
+              for c in report.get("affected_components", []):
+                  if c not in components:
+                      components.append(c)
+              for r in report.get("risks", []):
+                  risks.append(r)
+              for q in report.get("open_questions", []):
+                  if q not in questions:
+                      questions.append(q)
+              effort = report.get("effort_estimate", {}).get("size", "S")
+              if effort_order.get(effort, 1) > effort_order.get(best_effort, 1):
+                  best_effort = effort
+              if isinstance(report.get("confidence_score"), int):
+                  confidence_values.append(report["confidence_score"])
+
+          overall_confidence = int(sum(confidence_values) / len(confidence_values)) if confidence_values else 30
+          final = {
+              "overall_verdict": overall_verdict,
+              "impacted_repositories": repos,
+              "impacted_components": components or ["unknown"],
+              "overall_effort_estimate": {
+                  "size": best_effort,
+                  "rationale": "Derived from maximum effort estimate across spoke repositories."
+              },
+              "cross_repo_risks": risks[:12],
+              "open_questions": questions[:12],
+              "overall_confidence_score": overall_confidence,
+              "incomplete_repositories": incomplete,
+              "repo_summaries": reports
+          }
+          Path("out/final-assessment.json").write_text(json.dumps(final, ensure_ascii=True, indent=2), encoding="utf-8")
+          PY
 
       - name: Render Jira comment
         run: |
