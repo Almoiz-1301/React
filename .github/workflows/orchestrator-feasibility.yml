@@ -31,7 +31,7 @@ permissions:
 
 env:
   # Comma-separated owner/repo list
-  TARGET_REPOS: "Almoiz-1310/Plugins,Almoiz-1310/AnotherRepo"
+  TARGET_REPOS: "Almoiz-1310/Plugin,Almoiz-1301/Python"
   EVENT_TYPE: jira_feature_request
   # Set to "true" for no-AI integration tests
   USE_SIMULATED_AGGREGATION: "true"
