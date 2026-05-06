@@ -31,7 +31,7 @@ permissions:
 
 env:
   # Comma-separated owner/repo list
-  TARGET_REPOS: "Almoiz-1301/Plugin,Almoiz-1301/React"
+  TARGET_REPOS: "Almoiz-1301/Plugin,Almoiz-1301/Python"
   EVENT_TYPE: jira_feature_request
   POLL_TIMEOUT_SEC: "600"
   POLL_INTERVAL_SEC: "15"
